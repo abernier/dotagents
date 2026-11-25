@@ -1,0 +1,43 @@
+{
+  "version": 3,
+  "skills": {
+    "find-skills": {
+      "source": "vercel-labs/skills",
+      "sourceType": "github",
+      "sourceUrl": "https://github.com/vercel-labs/skills.git",
+      "skillPath": "skills/find-skills/SKILL.md",
+      "skillFolderHash": "c2f31172b6f256272305a5e6e7228b258446899f",
+      "installedAt": "2026-02-16T07:52:20.373Z",
+      "updatedAt": "2026-02-16T07:52:20.373Z"
+    },
+    "shadcn": {
+      "source": "shadcn-ui/ui",
+      "sourceType": "github",
+      "sourceUrl": "https://github.com/shadcn-ui/ui.git",
+      "skillPath": "skills/shadcn/SKILL.md",
+      "skillFolderHash": "58cbb5c7712d2f1ba359892c8c693d0efe96c829",
+      "sourceRef": "c2a67849be260701852b0977ba15eb5f3a0ce2a4",
+      "installedAt": "2026-10-11T08:42:45.893Z",
+      "updatedAt": "2026-10-11T08:42:45.893Z"
+    }
+  },
+  "dismissed": {
+    "findSkillsPrompt": true
+  },
+  "lastSelectedAgents": [
+    "amp",
+    "antigravity",
+    "antigravity-cli",
+    "cline",
+    "codex",
+    "cursor",
+    "deepagents",
+    "gemini-cli",
+    "github-copilot",
+    "kimi-code-cli",
+    "opencode",
+    "warp",
+    "zed",
+    "claude-code"
+  ]
+}

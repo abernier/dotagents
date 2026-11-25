@@ -1,0 +1,6 @@
+# Codex configuration: yours, never versioned. Created by the dotagents
+# installer from shared/codex-config.example.toml when ~/.codex/config.toml
+# is missing; Codex itself writes here too (project trust, app settings).
+
+# Read a repository's CLAUDE.md when it has no AGENTS.md.
+project_doc_fallback_filenames = ["CLAUDE.md"]

@@ -1,0 +1,29 @@
+{
+  "name": "dotagents",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.33.4",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "install-harness": "node --import tsx bin/install.mts",
+    "sync-skills": "node --import tsx bin/sync-skills.mts",
+    "test": "node --import tsx --test bin/*.test.mts shared/skills/*/*.test.mts",
+    "typecheck": "tsc --noEmit",
+    "format": "prettier --write bin 'shared/skills/**/*.mts' package.json tsconfig.json",
+    "lgtm": "prettier --check bin 'shared/skills/**/*.mts' package.json tsconfig.json && pnpm typecheck && pnpm test && pnpm check-generated",
+    "check-generated": "pnpm sync-skills --check"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "prettier": "^3.9.10",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "commander": "^14.0.3",
+    "yaml": "^2.9.1",
+    "zod": "^4.6.5"
+  }
+}

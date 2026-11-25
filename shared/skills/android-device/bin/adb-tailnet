@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+# adb-tailnet: connect adb to a phone's wireless debugging over Tailscale.
+#
+#   adb-tailnet connect <host>
+#
+# <host> is the phone's Tailscale name or address, its stable address: a LAN
+# address or an mDNS name stops working as soon as the phone is elsewhere.
+# A name is resolved with `tailscale ip -4 <name>`; an address is used as is.
+#
+# Android wireless debugging listens on a port it picks again every time the
+# setting is turned on, so the port is found, never asked for: every TCP port
+# from 1024 to 65535 on the address is probed, and adb connects to each open
+# one in turn until `adb devices` lists one as `device`. Its serial,
+# <address>:<port>, is printed on stdout, and that is the exit 0. A phone this
+# adb is already connected to over that address is printed as is, without a
+# scan.
+#
+# A port that comes up `offline` is disconnected again, so that it does not
+# linger in `adb devices`. Offline ports and none in `device` mean this
+# computer is likely not paired with the phone: the fix is `adb pair` (the
+# android-device skill says how), and the exit code is 1, as for any other
+# connection that fails. A usage error exits 2.
+#
+# Tailscale's CLI is `tailscale` on PATH, else the one inside the macOS app
+# bundle. ADB_TAILNET_ADB, ADB_TAILNET_TAILSCALE and ADB_TAILNET_SCANNER (a
+# command given the address, printing one open port per line) replace adb,
+# the Tailscale CLI and the built-in port scanner; the tests point them at
+# fakes. ADB_TAILNET_SETTLE_SECONDS (whole seconds, 3 by default) bounds the
+# wait for a port that has just connected to leave `offline`.
+#
+# Bash 3.2 and standard utilities, plus adb, and python3 for the scanner.
+set -u
+
+die() {
+  echo "adb-tailnet: $1" >&2
+  exit 1
+}
+
+usage_text() {
+  echo "Usage: adb-tailnet connect <host>"
+  echo
+  echo "Connect adb to the wireless debugging of the phone at <host>, its"
+  echo "Tailscale name or address, and print its serial (<address>:<port>)."
+}
+
+usage() { # $1 = what is wrong
+  {
+    echo "adb-tailnet: $1"
+    usage_text
+  } >&2
+  exit 2
+}
+
+# ── The command line ─────────────────────────────────────────────────────────
+case "${1:-}" in
+  -h | --help | help)
+    usage_text
+    exit 0
+    ;;
+  connect) ;;
+  "") usage "no command given" ;;
+  *) usage "unknown command: $1" ;;
+esac
+[ "$#" -ge 2 ] && [ -n "$2" ] || usage "connect needs a host"
+[ "$#" -eq 2 ] || usage "unexpected argument: $3"
+host="$2"
+
+settle="${ADB_TAILNET_SETTLE_SECONDS:-3}"
+case "$settle" in
+  "" | *[!0-9]*) die "ADB_TAILNET_SETTLE_SECONDS ($settle) is not a whole number of seconds" ;;
+esac
+
+# ── Tools ────────────────────────────────────────────────────────────────────
+if [ -n "${ADB_TAILNET_ADB:-}" ]; then
+  adb="$(type -P "$ADB_TAILNET_ADB")" || die "ADB_TAILNET_ADB ($ADB_TAILNET_ADB) is not an executable"
+else
+  adb="$(type -P adb)" || die "adb not found on PATH ($PATH)"
+fi
+
+# Prints the Tailscale CLI's path.
+find_tailscale() {
+  if [ -n "${ADB_TAILNET_TAILSCALE:-}" ]; then
+    type -P "$ADB_TAILNET_TAILSCALE" || die "ADB_TAILNET_TAILSCALE ($ADB_TAILNET_TAILSCALE) is not an executable"
+  elif type -P tailscale; then
+    :
+  elif [ -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ]; then
+    echo /Applications/Tailscale.app/Contents/MacOS/Tailscale
+  else
+    die "tailscale not found on PATH ($PATH) nor in /Applications/Tailscale.app"
+  fi
+}
+
+# ── The address ──────────────────────────────────────────────────────────────
+# An IPv4 address is digits and dots, an IPv6 one has colons; anything else
+# is a name for Tailscale to resolve.
+case "$host" in
+  *:*) address="$host" ;;
+  *[!0-9.]*)
+    tailscale="$(find_tailscale)" || exit 1
+    address="$("$tailscale" ip -4 "$host" 2>/dev/null | head -n 1)"
+    address="${address%$'\r'}"
+    [ -n "$address" ] ||
+      die "tailscale cannot resolve $host: is it a device of this tailnet, and is Tailscale up here?"
+    ;;
+  *) address="$host" ;;
+esac
+# adb writes an IPv6 serial with the address in brackets.
+case "$address" in
+  *:*) serial_prefix="[$address]:" ;;
+  *) serial_prefix="$address:" ;;
+esac
+
+# ── adb's view ───────────────────────────────────────────────────────────────
+# `adb devices` lists one "<serial>\t<state>" line per device, under a header,
+# with CR LF line ends on some versions.
+
+# The state `adb devices` lists for a serial, empty when it lists none.
+state_of() { # $1 = the serial
+  "$adb" devices | tr -d '\r' | awk -F '\t' -v serial="$1" '$1 == serial { print $2; exit }'
+}
+
+# The first serial on this address that `adb devices` lists as `device`.
+already_connected() {
+  "$adb" devices | tr -d '\r' | awk -F '\t' -v prefix="$serial_prefix" \
+    'index($1, prefix) == 1 && $2 == "device" { print $1; exit }'
+}
+
+serial="$(already_connected)"
+if [ -n "$serial" ]; then
+  echo "$serial"
+  exit 0
+fi
+
+# ── The scan ─────────────────────────────────────────────────────────────────
+# One connection attempt per port, up to a thousand at a time, half a second
+# each: a phone refuses a closed port at once, so the whole range takes
+# well under a minute. The soft limit on open files is raised first: macOS
+# starts it at 256.
+scan_program='
+import asyncio, resource, sys
+
+address = sys.argv[1]
+soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+wanted = 4096 if hard == resource.RLIM_INFINITY else min(4096, hard)
+if soft < wanted:
+    resource.setrlimit(resource.RLIMIT_NOFILE, (wanted, hard))
+    soft = wanted
+
+async def probe(port, gate):
+    async with gate:
+        try:
+            _, writer = await asyncio.wait_for(asyncio.open_connection(address, port), 0.5)
+        except (OSError, asyncio.TimeoutError):
+            return None
+        writer.close()
+        return port
+
+async def main():
+    gate = asyncio.Semaphore(max(1, min(1000, soft - 64)))
+    ports = await asyncio.gather(*(probe(port, gate) for port in range(1024, 65536)))
+    for port in ports:
+        if port:
+            print(port)
+
+asyncio.run(main())
+'
+
+scan() {
+  if [ -n "${ADB_TAILNET_SCANNER:-}" ]; then
+    "$ADB_TAILNET_SCANNER" "$address"
+  else
+    type -P python3 >/dev/null || die "python3 not found on PATH ($PATH): the port scan needs it"
+    python3 -I -c "$scan_program" "$address"
+  fi
+}
+
+ports="$(scan)" || die "the port scan of $address failed"
+[ -n "$ports" ] || die "no open port on $address: is wireless debugging on, and the phone on Wi-Fi?"
+
+# ── Connect ──────────────────────────────────────────────────────────────────
+offline=""
+for port in $ports; do
+  serial="$serial_prefix$port"
+  "$adb" connect "$serial" >/dev/null 2>&1
+  state="$(state_of "$serial")"
+  polls=$((settle * 2))
+  while [ "$state" = offline ] && [ "$polls" -gt 0 ]; do
+    sleep 0.5
+    polls=$((polls - 1))
+    state="$(state_of "$serial")"
+  done
+  case "$state" in
+    device)
+      echo "$serial"
+      exit 0
+      ;;
+    offline)
+      offline="$offline $serial"
+      "$adb" disconnect "$serial" >/dev/null 2>&1
+      ;;
+    "") ;;
+    *) "$adb" disconnect "$serial" >/dev/null 2>&1 ;;
+  esac
+done
+
+if [ -n "$offline" ]; then
+  die "came up offline:$offline. This computer is likely not paired with the phone: pair it with \`adb pair <address>:<port>\` from \"Pair device with pairing code\", then connect again"
+fi
+die "no open port on $address answered as an adb device (open: $(echo $ports))"

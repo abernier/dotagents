@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Entry point linked into ~/.local/bin; the TypeScript lives beside the skill.
+set -euo pipefail
+here=$(dirname "$(realpath "$0")")
+exec node --experimental-strip-types --disable-warning=ExperimentalWarning \
+  "$here/../toSpecDrawer.cli.mts" "$@"

@@ -1,0 +1,100 @@
+{
+  "title": "Bench harness: a verdict you can trust",
+  "problem": "A bench run on a busy machine returns numbers that look precise and are not, and nothing says so.",
+  "solution": "The harness waits for a calm machine, samples it during the run, and compares runs with statistics that say when a difference is real.",
+  "furtherNotes": "Runs on the quiet machine through bench-remote.",
+  "outOfScope": ["Benchmarking on Windows."],
+  "selected": ["A3a", "C1"],
+  "drawers": [
+    {
+      "id": "A",
+      "title": "Calm verdict",
+      "summary": "Know the machine was quiet."
+    },
+    { "id": "C", "title": "Statistics" }
+  ],
+  "options": [
+    {
+      "id": "A1",
+      "drawer": "A",
+      "label": "Load check before the run",
+      "userStories": [
+        "As a developer, I want the bench to refuse a loaded machine, so that I never read noise as a result"
+      ],
+      "implementationDecisions": [
+        "The lock samples load average before it hands over the machine."
+      ],
+      "testingDecisions": ["Drive the lock with a faked load average."]
+    },
+    {
+      "id": "A2",
+      "drawer": "A",
+      "parent": "A1",
+      "label": "Wait until calm",
+      "summary": "Wait instead of refusing.",
+      "userStories": [
+        "As a developer, I want the bench to wait for a calm machine, so that I do not retry by hand"
+      ],
+      "implementationDecisions": [
+        "The wait is bounded and reports how long it waited."
+      ],
+      "testingDecisions": []
+    },
+    {
+      "id": "A3a",
+      "drawer": "A",
+      "parent": "A2",
+      "label": "Calm verdict in the report",
+      "userStories": [
+        "As a reviewer, I want the report to state the machine state, so that I can trust the numbers"
+      ],
+      "implementationDecisions": [],
+      "testingDecisions": ["Snapshot the report header."]
+    },
+    {
+      "id": "B1",
+      "drawer": "A",
+      "label": "In-run sampling",
+      "summary": "Sample load during the run.",
+      "requires": ["A1"],
+      "userStories": [
+        "As a developer, I want load sampled during the run, so that a mid-run spike is caught"
+      ],
+      "implementationDecisions": [],
+      "testingDecisions": []
+    },
+    {
+      "id": "C1",
+      "drawer": "C",
+      "label": "Compare two runs",
+      "userStories": [
+        "As a developer, I want to compare two runs, so that I know whether a change helped"
+      ],
+      "implementationDecisions": ["bench-compare reads two result files."],
+      "testingDecisions": []
+    },
+    {
+      "id": "C1v",
+      "drawer": "C",
+      "parent": "C1",
+      "exclusiveGroup": "C1-test",
+      "default": true,
+      "label": "Mann-Whitney test",
+      "summary": "Rank-based, no normality assumption.",
+      "userStories": [],
+      "implementationDecisions": ["Significance by Mann-Whitney U."],
+      "testingDecisions": []
+    },
+    {
+      "id": "C1t",
+      "drawer": "C",
+      "parent": "C1",
+      "exclusiveGroup": "C1-test",
+      "label": "Welch t-test",
+      "summary": "Assumes roughly normal samples.",
+      "userStories": [],
+      "implementationDecisions": ["Significance by Welch's t-test."],
+      "testingDecisions": []
+    }
+  ]
+}

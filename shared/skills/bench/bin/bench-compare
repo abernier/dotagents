@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# bench-compare: is the experiment's sample set shifted from the control's?
+# Input and options: "Compare two builds"; output, verdict and exit codes:
+# "The bench-compare verdict". Both in the bench skill's SKILL.md, one
+# directory up from this launcher.
+#
+# This launcher only finds bench-compare.mts, beside SKILL.md, and runs it with
+# Node, which strips the types itself (the harness requires Node 22.18 or
+# later). It runs on the caller, never on a worker, inside a harness checkout
+# installed with `pnpm install`. Reached through its ~/.local/bin symlink from
+# any working directory, it follows the symlinks to its real location first:
+# the code's imports then resolve from the checkout, never from the caller's
+# directory.
+set -u
+
+source="$0"
+while [ -L "$source" ]; do
+  directory=$(cd -P "$(dirname "$source")" && pwd)
+  source=$(readlink "$source")
+  case "$source" in
+    /*) ;;
+    *) source="$directory/$source" ;;
+  esac
+done
+skill=$(cd -P "$(dirname "$source")/.." && pwd)
+
+exec node --disable-warning=ExperimentalWarning "$skill/bench-compare.mts" "$@"

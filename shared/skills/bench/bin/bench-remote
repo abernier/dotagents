@@ -1,0 +1,723 @@
+#!/usr/bin/env bash
+# bench-remote: run a bench on a quiet machine, from the current commit.
+#
+#   bench-remote <host> -- <command...>
+#   bench-remote <host> status
+#   bench-remote <host> attach <run id>
+#
+# Runs <command...> on <host>, in a checkout of exactly the commit the caller
+# is on, detached so that it survives the caller's laptop going to sleep. The
+# output is shown live, and the job's exit code is returned. Every run is kept
+# on the worker: `status` lists them, `attach` follows one, live while it is
+# still running, from its kept log once it is over, and returns its exit code.
+#
+# A run that is a `bench-ab` session is compared here, on the caller: a job
+# that exits 0 and whose log holds `bench: sample` lines has those samples
+# handed to the caller's `bench-compare`, with the options the log names, and
+# its verdict and exit code are the run's (see compare_ab_samples).
+#
+# Always explicit: the host is always given, nothing sends a bench elsewhere on
+# its own, and this never pushes. A commit already on origin is fetched there;
+# an unpushed commit has its unpushed delta sent over ssh as a git bundle.
+set -u
+
+# Any failure of the tool itself exits 125, as `bench-lock` does: the other
+# codes belong to the bench.
+die() {
+  echo "bench-remote: $1" >&2
+  exit 125
+}
+
+usage() {
+  {
+    echo "Usage: bench-remote <host> -- <command...>"
+    echo "       bench-remote <host> status"
+    echo "       bench-remote <host> attach <run id>"
+  } >&2
+  exit 125
+}
+
+# ── The commit to measure ────────────────────────────────────────────────────
+# The worker fetches from the repository's origin when the commit is already
+# there. origin is fetched first: a remote-tracking branch that still names a
+# commit force-pushed away since would let a run through that the worker cannot
+# fetch. A commit not on origin is not pushed; its unpushed delta is bundled on
+# the caller and copied to the run directory on the worker instead.
+commit="" origin_url="" commit_pushed=""
+find_commit() {
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git repository"
+  commit="$(git rev-parse --verify HEAD 2>/dev/null)" || die "this repository has no commit yet"
+  origin_url="$(git config --get remote.origin.url)" || die "this repository has no origin to fetch from"
+  git fetch --quiet --prune origin || die "cannot reach origin to check that $commit is pushed"
+  if [ -n "$(git for-each-ref --count=1 --contains "$commit" refs/remotes/origin)" ]; then
+    commit_pushed=1
+  else
+    commit_pushed=0
+  fi
+}
+
+# The worker clones over HTTPS: it has no key for GitHub, the GitHub CLI's
+# HTTPS credentials are what it has. An ssh URL is rewritten to its HTTPS twin;
+# anything else is passed as it is.
+https_url() { # $1 = URL
+  case "$1" in
+    git@*:*)
+      local rest="${1#git@}"
+      echo "https://${rest%%:*}/${rest#*:}"
+      ;;
+    ssh://*)
+      local rest="${1#ssh://}"
+      rest="${rest#*@}"
+      # An ssh port has no meaning over HTTPS.
+      local authority="${rest%%/*}"
+      echo "https://${authority%%:*}/${rest#*/}"
+      ;;
+    *) echo "$1" ;;
+  esac
+}
+
+# ── Talking to the worker ────────────────────────────────────────────────────
+# BENCH_REMOTE_SSH replaces ssh; the tests point it at a fake.
+#
+# ssh hands its command to the worker user's shell, whatever that shell is, as
+# one string: every word sent is quoted for a POSIX shell. Nothing that ssh
+# prints is ever parsed: a shell startup file may print to stdout. What comes
+# back is either shown to the caller as it is, or an exit status.
+ssh_command="${BENCH_REMOTE_SSH:-ssh}"
+on_worker() { # $1 = command line for the worker's shell; stdin is passed on
+  "$ssh_command" "$host" "$1"
+}
+
+# The laptop's leg to the worker is Wi-Fi, and a connection to it fails now and
+# then ("No route to host"). ssh exits 255 when it could not connect or lost
+# the connection, and only then: any other status is the remote command's. So
+# a call that exits 255 is tried again, three times after the first try, after
+# 2, 4 and 8 seconds: long enough to ride out a Wi-Fi hiccup, short enough to
+# give up while the caller still waits. BENCH_REMOTE_RETRY_DELAYS replaces the
+# delays, one per retry; the tests set them to 0.
+#
+# None of the commands sent this way exits 255 on its own: a 255 is always the
+# connection. Following a run is the one call that can see a 255 of the job's
+# own, and it has its own loop (follow_run).
+read -r -a retry_delays <<<"${BENCH_REMOTE_RETRY_DELAYS:-2 4 8}"
+
+# Says that retry number $1 (from 0) is about to happen and waits for it, or
+# returns 1 once every retry is spent. $2 says what is retried.
+wait_for_retry() { # $1 = retries already made, $2 = what failed
+  [ "$1" -lt "${#retry_delays[@]}" ] || return 1
+  local delay="${retry_delays[$1]}"
+  echo "bench-remote: $2 (ssh exited 255); retry $(($1 + 1)) of ${#retry_delays[@]} in ${delay}s" >&2
+  sleep "$delay"
+}
+
+# on_worker, retried on 255. A call that sends something on stdin names the
+# function that prints it, called again for every try: a stream half-read by a
+# dropped connection cannot be sent twice.
+on_worker_retried() { # $1 = function printing stdin, or "" for none; $2 = command line
+  local retries=0 code
+  while :; do
+    if [ -n "$1" ]; then
+      "$1" | on_worker "$2"
+    else
+      on_worker "$2" </dev/null
+    fi
+    code=$?
+    [ "$code" -eq 255 ] || return "$code"
+    wait_for_retry "$retries" "cannot reach $host" || return 255
+    retries=$((retries + 1))
+  done
+}
+
+quote() { # $1 = word, printed single-quoted
+  local escaped="'\\''"
+  printf "'%s'" "${1//\'/$escaped}"
+}
+
+# The words $@, as a shell reads them back, for a person to read: a word
+# quoted only when it needs to be.
+shell_words() {
+  local word line=""
+  for word in "$@"; do
+    case "$word" in
+      "" | *[!A-Za-z0-9_./:=@%+,-]*) word="$(quote "$word")" ;;
+    esac
+    line="$line${line:+ }$word"
+  done
+  printf '%s' "$line"
+}
+
+# The bench directory on the worker, and the logs directory in it: one
+# directory per run, named by its run id, holding
+#
+# written at launch:
+#
+#   commit.bundle     the unpushed delta, only when the commit is not on origin
+#   job.sh            the job, as launched
+#   command           the command run, as one line
+#   launcher-started  when the launched process started, as `ps` prints it
+#   launcher          the launched process, right after its nohup: the very
+#                     process that becomes the job, through two `exec`s
+#
+# written by the job, once its login profile has loaded:
+#
+#   claimed   a directory: the job's claim on the run, see below
+#   started   when the job's process started, as `ps` prints it
+#   pid       the job's process
+#   repo      the repository's directory name in the bench directory
+#   commit    the commit measured
+#   log       stdout and stderr of every step, the command included
+#   end-said  bench-lock's end-of-run line is in the log
+#   exit      the job's exit code, written once, when the job is over
+#
+# A run with an exit is over. A run with a pid and no exit is running, or died
+# without a word. A run with no pid yet is starting while its launcher lives,
+# its login profile still loading; with its launcher gone, or never recorded,
+# it never started, and never will.
+#
+# The launch is idempotent, so that a dropped connection can launch again: the
+# run id is fixed before the first try, and a launch that finds a launcher or
+# a pid in the run directory does nothing. One gap is left: a connection that
+# drops after the nohup, before `launcher` is written, so that the relaunch
+# starts a second job beside the first. The job closes it: it claims the run
+# first, with a `mkdir` that only one process can win, and a job that loses
+# exits at once without touching anything.
+#
+# The run id is the second, the repository and the commit: two launches of the
+# same commit within the same second, from two callers, would share one run,
+# the second following the first's. A bench is not launched twice a second.
+bench_dir='"$HOME/bench"'
+
+# ── The job ──────────────────────────────────────────────────────────────────
+# Runs on the worker, detached, through a login bash: the toolchain is only on
+# that shell's PATH. The values are set above this body by write_job.
+job_body() {
+  cat <<'JOB'
+bench="$HOME/bench"
+run="$bench/logs/$run_id"
+
+# The node the install and the command run with: the one the checkout's
+# .nvmrc pins, through nvm, installed first when missing. Without a .nvmrc,
+# or without nvm, the node already on PATH, as the login shell left it. The log
+# names the node used either way.
+#
+# nvm is a shell function, not an executable, and a function the login profile
+# defines does not survive into this file: the login shell runs it through a
+# fresh `bash`, and bench-lock runs this half again in another. So nvm is
+# loaded here, from the directory the profile exported in NVM_DIR (nvm's own
+# default otherwise), with --no-use: the version is the .nvmrc's to choose.
+use_pinned_node() {
+  if [ -f .nvmrc ]; then
+    local pinned nvm_sh="${NVM_DIR:-$HOME/.nvm}/nvm.sh"
+    pinned="$(cat .nvmrc)"
+    if [ "$(type -t nvm)" != function ] && [ -f "$nvm_sh" ]; then
+      . "$nvm_sh" --no-use
+    fi
+    if [ "$(type -t nvm)" = function ]; then
+      echo "bench-remote: .nvmrc pins node $pinned: nvm install"
+      if ! nvm install; then
+        echo "bench-remote: cannot install node $pinned, pinned by .nvmrc, with nvm"
+        return 125
+      fi
+    else
+      echo "bench-remote: .nvmrc pins node $pinned, but nvm is not on this worker: the node on PATH runs"
+    fi
+  fi
+  local node_path
+  if node_path="$(command -v node)"; then
+    echo "bench-remote: node $(node --version) ($node_path)"
+  else
+    echo "bench-remote: no node on PATH"
+  fi
+}
+
+# Any step before the command fails the run with 125, as a failure of the tool.
+prepare_and_run() {
+  local checkout="$bench/$repo_name"
+  if [ -d "$checkout/.git" ]; then
+    echo "bench-remote: fetching into $checkout"
+    git -C "$checkout" fetch --quiet origin || return 125
+  else
+    echo "bench-remote: cloning $repo_url into $checkout"
+    git clone --quiet "$repo_url" "$checkout" || return 125
+  fi
+  if [ -f "$run/commit.bundle" ]; then
+    echo "bench-remote: fetching unpushed commit $commit from local bundle"
+    git -C "$checkout" fetch --quiet "$run/commit.bundle" HEAD || return 125
+  fi
+  cd "$checkout" || return 125
+  git -c advice.detachedHead=false checkout --quiet --detach "$commit" || return 125
+  use_pinned_node || return 125
+  if [ -f pnpm-lock.yaml ]; then
+    echo "bench-remote: pnpm install --frozen-lockfile"
+    pnpm install --frozen-lockfile || return 125
+  else
+    echo "bench-remote: no pnpm-lock.yaml, no dependencies installed"
+  fi
+  # The install is load on the machine too: the machine is read again, and
+  # waited on while noisy, as bench-lock did before the fetch.
+  "$bench/bin/bench-lock" settle
+  # The caller's bench-lock, bench-device and bench-ab, first: a bench that
+  # calls any of them, through the repo's shim or bench-ab's own, finds the
+  # lock already held and runs straight through.
+  export PATH="$bench/bin:$PATH"
+  # bench-ab, without bench-compare, then leaves the comparison to the caller.
+  export BENCH_REMOTE_RUN_ID="$run_id"
+  echo "bench-remote: running $command_line"
+  "${command[@]}"
+}
+
+# The second half: this same file, run again under the lock.
+if [ "${1:-}" = under-the-lock ]; then
+  prepare_and_run
+  exit
+fi
+
+# The claim on the run, before anything else is touched: a second job,
+# launched again after a dropped connection, finds it taken and leaves the run
+# to the first.
+mkdir "$run/claimed" 2>/dev/null || exit 0
+
+# The pid alone could name an unrelated process once the job is gone: its
+# start time goes first, so that whoever reads the pid can tell them apart.
+LC_ALL=C TZ=UTC0 ps -o lstart= -p "$$" >"$run/started"
+printf '%s\n' "$$" >"$run/pid"
+printf '%s\n' "$repo_name" >"$run/repo"
+printf '%s\n' "$commit" >"$run/commit"
+exec >"$run/log" 2>&1 </dev/null
+
+# The worker's bench lock is held from the fetch on: the checkout is shared by
+# every run of the repository, and a fetch or an install is load on the
+# machine. A bench that takes no lock of its own is covered too. The
+# `bench-lock settle` after the install starts the end-of-run reading over:
+# the verdict covers the command alone.
+#
+# A worker that sleeps mid-run stops the bench and the clock with it, and the
+# numbers are wrong without a word. The worker is set never to sleep (its
+# owner's step, see the skill); caffeinate holds the machine awake for the run
+# all the same, on macOS, where it is. Elsewhere the command runs plainly.
+keep_awake=""
+if command -v caffeinate >/dev/null 2>&1; then keep_awake="caffeinate -i"; fi
+BENCH_LOCK_END_MARKER="$run/end-said" $keep_awake "$bench/bin/bench-lock" run -- bash "$run/job.sh" under-the-lock
+code=$?
+# bench-lock's end-of-run line lands a moment after the command is gone, from
+# a sampler that outlives it: the job waits for the marker that sampler leaves
+# once the line is in the log, so the log is whole before the exit code a
+# follower stops at is written. Capped at 10 s, for a bench-lock that never got
+# as far as its sampler. Not a pipe: a pipe stays open as long as anything the
+# bench left behind holds stderr, and the run with it.
+waited=0
+while [ ! -e "$run/end-said" ] && [ "$waited" -lt 50 ]; do
+  sleep 0.2
+  waited=$((waited + 1))
+done
+# Whole or absent: whoever reads it reads a finished number.
+printf '%s\n' "$code" >"$run/exit.new" && mv -f "$run/exit.new" "$run/exit"
+JOB
+}
+
+write_job() {
+  local word
+  echo "#!/usr/bin/env bash"
+  echo "run_id=$(quote "$run_id")"
+  echo "repo_name=$(quote "$repo_name")"
+  echo "repo_url=$(quote "$repo_url")"
+  echo "commit=$(quote "$commit")"
+  echo "commit_source=$(quote "$commit_source")"
+  echo "command_line=$(quote "$command_line")"
+  printf 'command=('
+  for word in "$@"; do printf ' %s' "$(quote "$word")"; done
+  echo ' )'
+  job_body
+}
+
+# What on_worker_retried sends again on every try: the job, for the command
+# kept in job_command, one of the caller's tools, from tool_path, and the
+# unpushed commit bundle, from bundle_path.
+job_command=()
+write_job_again() { write_job "${job_command[@]}"; }
+tool_path=""
+send_tool() { cat "$tool_path"; }
+bundle_path=""
+send_bundle() { cat "$bundle_path"; }
+cleanup_bundle() { [ -n "$bundle_path" ] && rm -f "$bundle_path"; }
+
+# Creates a minimal git bundle of the unpushed delta for HEAD. Falls back to a
+# full bundle of HEAD when the delta bundle fails or is empty (for instance,
+# when origin has no shared history).
+create_bundle() {
+  bundle_path="$(mktemp "${TMPDIR:-/tmp}/bench-remote-bundle.XXXXXX")" ||
+    die "cannot create a temporary file for the commit bundle"
+  trap cleanup_bundle EXIT
+  if ! git bundle create --quiet "$bundle_path" HEAD --not --remotes=origin 2>/dev/null || [ ! -s "$bundle_path" ]; then
+    rm -f "$bundle_path"
+    git bundle create --quiet "$bundle_path" HEAD || die "cannot create git bundle for $commit"
+    [ -s "$bundle_path" ] || die "cannot create git bundle for $commit"
+  fi
+}
+
+# Copies the caller's unpushed commit bundle into the run directory on the
+# worker, whole through a rename, so a retried transfer never leaves a partial
+# bundle behind.
+copy_bundle() { # $1 = remote run directory
+  on_worker_retried send_bundle "mkdir -p $1 &&
+    cat >$1/commit.bundle.new.\$\$ &&
+    mv -f $1/commit.bundle.new.\$\$ $1/commit.bundle" >&2 ||
+    die "cannot copy commit bundle to $host"
+}
+
+# Copies the caller's tool $1, which sits next to this file, to the worker's
+# bench bin directory: the worker has no harness installed. It lands whole,
+# through a rename, so that a run starting meanwhile never runs half a file.
+copy_tool() { # $1 = tool name, $2 = the directory this file sits in
+  tool_path="$2/$1"
+  on_worker_retried send_tool "mkdir -p $bench_dir/bin &&
+    cat >$bench_dir/bin/$1.new.\$\$ &&
+    chmod 755 $bench_dir/bin/$1.new.\$\$ &&
+    mv -f $bench_dir/bin/$1.new.\$\$ $bench_dir/bin/$1" >&2 ||
+    die "cannot copy $1 to $host"
+}
+
+# ── The launch ───────────────────────────────────────────────────────────────
+# Runs on the worker with `sh -c <this> launch <run directory> <command line>`,
+# the job on stdin, in sh whatever the worker user's shell is. Idempotent (see
+# the run directory's layout): it does nothing for a run already launched, so
+# that a launch whose connection dropped can be tried again.
+#
+# The job is detached from the connection, every stream included, so that ssh
+# returns at once and a dropped connection leaves the job running. The login
+# shell's own output goes nowhere. The command is written before the launch,
+# so that `status` names it while the login profile loads. job.sh lands whole,
+# through a rename: a relaunch may write it again while a first job reads it.
+# The launcher's pid and start time are recorded right after the nohup, the
+# pid last and whole: while that process lives and no pid is written, the run
+# is starting.
+launch_script() {
+  cat <<'LAUNCH'
+run="$1"
+mkdir -p "$run" || exit 125
+if [ -f "$run/launcher" ] || [ -f "$run/pid" ]; then
+  cat >/dev/null
+  exit 0
+fi
+cat >"$run/job.sh.new" && mv -f "$run/job.sh.new" "$run/job.sh" || exit 125
+printf '%s\n' "$2" >"$run/command" || exit 125
+nohup bash -lc 'exec bash "$0"' "$run/job.sh" </dev/null >/dev/null 2>&1 &
+launcher=$!
+LC_ALL=C TZ=UTC0 ps -o lstart= -p "$launcher" >"$run/launcher-started"
+printf '%s\n' "$launcher" >"$run/launcher.new" && mv -f "$run/launcher.new" "$run/launcher"
+LAUNCH
+}
+
+# ── Reading the runs ─────────────────────────────────────────────────────────
+# Runs on the worker with `sh -s -- <verb> [<run id>] [<offset>]`. What it
+# prints is shown to the caller as it is; the exit status is what the caller
+# acts on.
+#
+#   status                 lists the runs kept, oldest first: id, state, command
+#   follow <id> [<offset>] prints the log as it grows, past its first <offset>
+#                          bytes (0 by default), and once the exit file is
+#                          there, prints the rest and exits with the job's
+#                          code. That code comes back as ssh's own exit status.
+#                          A finished run's log is printed whole.
+#   exited-255 <id>        exits 0 if the run is over and its exit code is 255,
+#                          1 otherwise: a 255 from `follow` was the job's own.
+worker_script() {
+  cat <<'WORKER'
+logs="$HOME/bench/logs"
+
+# Whether the job's process is still there: its pid, started at the time
+# recorded, as bench-lock judges its holder. A pid now held by a process that
+# started at another time was handed on after the job died. A start time that
+# was never recorded cannot be compared: the pid alone answers.
+# The launcher is judged the same way, from its own pid and start time.
+is_alive() { # $1 = pid file, $2 = start time file
+  [ -f "$1" ] || return 1
+  started="$(LC_ALL=C TZ=UTC0 ps -o lstart= -p "$(cat "$1")" 2>/dev/null)" || return 1
+  [ -n "$started" ] || return 1
+  recorded=""
+  [ -f "$2" ] && recorded="$(cat "$2")"
+  [ -z "$recorded" ] || [ "$started" = "$recorded" ]
+}
+
+# exit <code>; running; died (a pid, no exit code, no process); starting (no
+# pid yet, the launcher alive: the login profile is loading); or not started
+# (no pid, the launcher gone or never recorded: the job never got going, and
+# never will). A job that wrote its pid is running even if its launcher was
+# never recorded. A run claimed with no pid yet is starting too: the job that
+# claimed it is writing its pid this instant, while the launcher on record may
+# be a second job that lost the claim and left.
+state_of() { # $1 = run directory
+  if [ -f "$1/exit" ]; then
+    echo "exit $(cat "$1/exit")"
+  elif [ -f "$1/pid" ]; then
+    if is_alive "$1/pid" "$1/started"; then
+      echo running
+    elif [ -f "$1/exit" ]; then
+      # It ended between the two looks.
+      echo "exit $(cat "$1/exit")"
+    else
+      echo died
+    fi
+  elif is_alive "$1/launcher" "$1/launcher-started" || [ -d "$1/claimed" ]; then
+    echo starting
+  elif [ -f "$1/pid" ] || [ -f "$1/exit" ]; then
+    # The job got going between the looks: look again.
+    state_of "$1"
+  else
+    echo "not started"
+  fi
+}
+
+status() {
+  found=""
+  for run in "$logs"/*/; do
+    [ -d "$run" ] || continue
+    found=1
+    run="${run%/}"
+    command=""
+    [ -f "$run/command" ] && command="$(cat "$run/command")"
+    printf '%s  %-11s  %s\n' "${run##*/}" "$(state_of "$run")" "$command"
+  done
+  if [ -z "$found" ]; then
+    echo "bench-remote: no run kept on this worker yet"
+  fi
+}
+
+follow() { # $1 = run id, $2 = bytes of the log already shown
+  run="$logs/$1"
+  if [ ! -d "$run" ]; then
+    echo "bench-remote: no run $1 on this worker; status lists the runs kept" >&2
+    exit 125
+  fi
+  shown=$2
+  while :; do
+    over=""
+    [ -f "$run/exit" ] && over=1
+    if [ -f "$run/log" ]; then
+      size=$(($(wc -c <"$run/log")))
+      if [ "$size" -gt "$shown" ]; then
+        tail -c +"$((shown + 1))" "$run/log" | head -c "$((size - shown))"
+        shown=$size
+      fi
+    fi
+    if [ -n "$over" ]; then
+      exit "$(cat "$run/exit")"
+    fi
+    case "$(state_of "$run")" in
+      died)
+        echo "bench-remote: the job died without an exit code" >&2
+        exit 125
+        ;;
+      "not started")
+        echo "bench-remote: no pid and no launcher alive: the run is not started; see $run" >&2
+        exit 125
+        ;;
+    esac
+    sleep 1
+  done
+}
+
+case "$1" in
+  status) status ;;
+  follow) follow "$2" "${3:-0}" ;;
+  exited-255) [ "$(cat "$logs/$2/exit" 2>/dev/null)" = 255 ] ;;
+  *) exit 125 ;;
+esac
+WORKER
+}
+
+# ── The verbs ────────────────────────────────────────────────────────────────
+
+# Follows a run to its end and exits with the job's code. The run goes on
+# whatever happens to this connection: when it is lost for good, or
+# interrupted, the caller is told how to pick the run up again.
+#
+# ssh exits 255 when the connection is lost, and the job may exit 255 too: the
+# two come back alike. A probe tells them apart, by its exit status alone:
+# `exited-255` on the worker. The job's own 255 is returned as it is. A lost
+# connection is followed again, from where the output stopped, with the retry
+# budget of on_worker_retried; a follow that showed some of the log since the
+# last loss starts that budget afresh, so that a long run survives a drop now
+# and then. Once the budget is spent, the tool fails (125) and says how to
+# attach.
+#
+# Where the output stopped: what ssh printed is copied, as it is shown, into a
+# file, whose size counts it; nothing in it is read. What ssh prints also
+# holds whatever the worker's shell startup files print on every connection,
+# before the command runs. The probe prints nothing of its own, so its output
+# is exactly that, and it is taken off each follow's count. A startup file
+# that printed a different number of bytes from one connection to the next
+# would shift the resumed output by the difference.
+follow_run() { # $1 = run id
+  local id="$1" scratch shown probed
+  scratch="$(mktemp -d)" || die "cannot make a temporary directory"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$scratch'" EXIT
+  shown="$scratch/shown" probed="$scratch/probed"
+  : >"$shown"
+  trap 'echo "bench-remote: interrupted; the run goes on on $host: bench-remote $host attach $id" >&2; exit 130' INT
+
+  local follows=0 noise=0 retries=0 offset before code probe
+  while :; do
+    offset=$(($(wc -c <"$shown") - follows * noise))
+    [ "$offset" -ge 0 ] || offset=0
+    before=$(($(wc -c <"$shown")))
+    worker_script | on_worker "sh -s -- follow $(quote "$id") $offset" | tee -a "$shown"
+    code=${PIPESTATUS[1]}
+    follows=$((follows + 1))
+    [ "$code" -eq 255 ] || break
+
+    # A 255: the job's, or the connection's. The probe is retried while it
+    # cannot connect, from the same budget.
+    while :; do
+      worker_script | on_worker "sh -s -- exited-255 $(quote "$id")" >"$probed"
+      probe=$?
+      [ "$probe" -eq 255 ] || break
+      wait_for_retry "$retries" "lost the connection to $host" || lost_for_good "$id"
+      retries=$((retries + 1))
+    done
+    noise=$(($(wc -c <"$probed")))
+    if [ $(($(wc -c <"$shown") - before)) -gt "$noise" ]; then
+      # Some of the log came through since the last loss.
+      retries=0
+    fi
+    if [ "$probe" -eq 0 ]; then
+      # The job's own 255. Whatever of its log a lost connection kept from
+      # view is shown, then its code returned, whatever this last follow
+      # returns: 255 either way.
+      offset=$(($(wc -c <"$shown") - follows * noise))
+      [ "$offset" -ge 0 ] || offset=0
+      worker_script | on_worker "sh -s -- follow $(quote "$id") $offset"
+      code=255
+      break
+    fi
+    wait_for_retry "$retries" "lost the connection to $host" || lost_for_good "$id"
+    retries=$((retries + 1))
+  done
+  trap - INT
+  [ "$code" -eq 0 ] && compare_ab_samples "$shown" "$scratch"
+  exit "$code"
+}
+
+# A bench-ab session's samples, compared on the caller from the lines bench-ab
+# prints in the log (see its header). Without bench-compare here, the run
+# cannot be judged: a tool failure, never green.
+compare_ab_samples() { # $1 = the log as shown, $2 = a scratch directory
+  grep -q '^bench: sample ' "$1" || return 0
+  command -v bench-compare >/dev/null 2>&1 ||
+    die "the run's A/B samples cannot be compared: bench-compare is not on this machine's PATH"
+  sed -n 's/^bench: sample control //p' "$1" >"$2/control"
+  sed -n 's/^bench: sample experiment //p' "$1" >"$2/experiment"
+  local options=() option
+  while IFS= read -r option; do
+    options+=("$option")
+  done < <(sed -n 's/^bench: compare option //p' "$1")
+  local caller
+  caller="$(uname -n)"
+  echo "bench-remote: comparing on ${caller%%.*}: $(shell_words bench-compare ${options[@]+"${options[@]}"})"
+  bench-compare ${options[@]+"${options[@]}"} "$2/control" "$2/experiment"
+  exit
+}
+
+lost_for_good() { # $1 = run id
+  {
+    echo "bench-remote: the connection to $host is lost, every retry spent"
+    echo "bench-remote: the run goes on without this connection; its log and exit code stay on $host in ~/bench/logs/$1"
+    echo "bench-remote: pick it up with: bench-remote $host attach $1"
+  } >&2
+  exit 125
+}
+
+show_status() {
+  on_worker_retried worker_script "sh -s -- status" || die "cannot list the runs on $host"
+}
+
+attach() { # $1 = run id
+  case "$1" in
+    "" | . | .. | -* | */*) die "not a run id: '$1'; bench-remote $host status lists the runs" ;;
+  esac
+  follow_run "$1"
+}
+
+run_command() { # $@ = command
+  local run_id repo_url repo_name command_line commit_source
+  command_line="$(shell_words "$@")"
+  # One line, for the log and for whoever lists the runs.
+  command_line="${command_line//$'\n'/ }"
+  find_commit
+  if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+    echo "bench-remote: uncommitted changes are not part of the run, which measures $commit" >&2
+  fi
+  repo_url="$(https_url "$origin_url")"
+  repo_name="$(basename "$repo_url")"
+  repo_name="${repo_name%.git}"
+  case "$repo_name" in "" | . | ..) die "cannot name a checkout after origin $origin_url" ;; esac
+  run_id="$(date +%Y%m%d-%H%M%S)-$repo_name-${commit:0:7}"
+
+  # The caller's bench-lock, bench-device and bench-ab sit next to this file.
+  # Links are followed: this file is reached through a link in the user's bin
+  # directory.
+  local self="$0" target
+  while [ -L "$self" ]; do
+    target="$(readlink "$self")"
+    case "$target" in
+      /*) self="$target" ;;
+      *) self="$(dirname "$self")/$target" ;;
+    esac
+  done
+  local tools_dir
+  tools_dir="$(dirname "$self")"
+  local tools="bench-lock bench-device bench-ab" name
+  for name in $tools; do
+    [ -f "$tools_dir/$name" ] || die "cannot find $name next to bench-remote ($tools_dir/$name)"
+  done
+
+  if [ "$commit_pushed" -eq 1 ]; then
+    commit_source=origin
+    echo "bench-remote: run $run_id on $host, commit $commit" >&2
+  else
+    commit_source=bundle
+    echo "bench-remote: run $run_id on $host, commit $commit (unpushed, sending local bundle)" >&2
+  fi
+
+  for name in $tools; do
+    copy_tool "$name" "$tools_dir"
+  done
+
+  local run_dir
+  run_dir="$bench_dir/logs/$(quote "$run_id")"
+  if [ "$commit_pushed" -eq 0 ]; then
+    create_bundle
+    copy_bundle "$run_dir"
+    cleanup_bundle
+    bundle_path=""
+    trap - EXIT
+  fi
+
+  job_command=("$@")
+  on_worker_retried write_job_again "sh -c $(quote "$(launch_script)") launch $run_dir $(quote "$command_line")" >&2 ||
+    die "cannot start the run on $host"
+
+  follow_run "$run_id"
+}
+
+[ "$#" -ge 2 ] || usage
+host="$1"
+case "$host" in "" | -*) usage ;; esac
+shift
+case "$1" in
+  --)
+    [ "$#" -ge 2 ] || usage
+    shift
+    run_command "$@"
+    ;;
+  status)
+    [ "$#" -eq 1 ] || usage
+    show_status
+    ;;
+  attach)
+    [ "$#" -eq 2 ] || usage
+    attach "$2"
+    ;;
+  *) usage ;;
+esac

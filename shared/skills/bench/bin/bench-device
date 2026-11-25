@@ -1,0 +1,583 @@
+#!/usr/bin/env bash
+# bench-device: bench on a real phone attached over USB, or refuse to.
+#
+#   bench-device run [--serial <serial>] [--reverse <port>]... -- <command...>
+#
+# A desktop with its CPU throttled is not a phone: a regression that only a
+# mobile GPU, a mobile scheduler or thermal limits reveal is invisible to it.
+# `run` wraps a repo's bench entry point the way `bench-lock run` does, and
+# makes sure the phone is one that can be measured on before the command
+# starts. The phone is a measuring target attached to this host, never a
+# worker: the host holds the lock, builds and serves; the phone plays.
+#
+# Lock first. Without BENCH_LOCK_HELD, `run` re-launches itself, with the same
+# arguments, through `bench-lock run --`: it waits its turn in the machine's
+# one bench queue, and every device step happens under the lock, so that no
+# other bench heats the phone or loads the host meanwhile. A signal during
+# that wait is `bench-lock`'s to handle: the run leaves the queue and exits
+# with 128+n. Under BENCH_LOCK_HELD (a repo shim or `bench-remote` took the
+# lock), `run` proceeds at once.
+#
+# Then the device. With --serial, that serial must be attached; without it,
+# exactly one device must be. It must be in adb's authorized `device` state,
+# its screen awake and its keyguard not showing: a sleeping or locked phone
+# measures a throttled, backgrounded browser. These are the settings that
+# drift, so they are read again on every run.
+#
+# Then a cool phone: a phone throttles itself when hot, and one still warm
+# from the bench before would throttle the first leg and not the second. Its
+# thermal status is polled until it is nominal (none), with a line on stderr
+# at once and on every poll after, naming the status, so that a long wait
+# never looks like a hang. The wait is bounded, 300 seconds by default: a
+# phone that never cools must not hold the queue forever, so once the bound
+# expires the run starts anyway, and the device verdict says so. A status that
+# cannot be read is not waited on. A signal during this wait ends the run with
+# the usual 128+n at once, whether it hits the process group or this process
+# alone: this process holds the lock, and the lock is free as soon as its
+# holder is gone. One line per poll is deliberate: the status is what a
+# watcher wants to see change. BENCH_DEVICE_THERMAL_SECONDS moves
+# the bound (whole seconds, 0 for no wait) and BENCH_DEVICE_THERMAL_POLL_SECONDS
+# the poll period (15 seconds by default, decimals allowed, never zero). The
+# bound is looked at between polls, so the wait may run over it by up to one
+# poll period.
+#
+# Then the phone's Chrome, cold-restarted on every run: force-stopped, then
+# started on a blank page through a view intent, which also brings it to the
+# front, then waited for, a bounded time, until its DevTools socket shows up.
+# A Chrome Android that has been running for long hangs a CDP client: it lists
+# a hidden target with an empty URL that never loads, and the client waits for
+# its first navigation. A fresh Chrome does not. The phone is dedicated to
+# benching, so losing its tabs is fine. A socket that never shows up is a
+# refusal.
+#
+# Then the ports, from scratch: the device's previous reversals and forwards
+# are cleared (the lock is held, so nothing else of ours uses them), then one
+# reversal per --reverse port, the same number on both sides, so that the
+# phone's Chrome reaches the host's servers at the origins the bench uses; then
+# one forward from a local port chosen by adb to Chrome's DevTools socket.
+# The wiring is not torn down afterwards: the next run clears it.
+#
+# Once Chrome's DevTools HTTP endpoint answers through that forward, every tab
+# but the blank one this run opened is closed, so tabs never pile up: each
+# start through a view intent opens one more. Chrome lists the tab in front
+# first, so the tab kept is the first blank one listed. A tab has a numeric id
+# there; the hidden target, with its long hexadecimal id, is no tab and is left
+# alone. The list is read line by line, relying on the one key per line
+# Chrome lays it out with: there is no JSON parser to rely on here.
+#
+# Last thing before the command: Chrome brought to the front again and the
+# screen woken, both no-ops when already so. A Chrome Android in the
+# background stops answering DevTools.
+#
+# Then `bench-lock settle`, the `bench-lock` found on PATH, called by this
+# process itself, so the end-of-run verdict leaves the preparation above (the
+# thermal wait, Chrome's restart) out of the bench: see bench-lock's settle.
+#
+# Then the device verdict, the last stderr line before the command, after
+# the lock's calm verdicts and any waiting line, saying in which state the
+# numbers are measured: the device's model and serial, its thermal status, its battery's
+# temperature and health, and the version of the Chrome that answers on the
+# DevTools endpoint (the package manager lists both the updated version and
+# the factory one). It notes a thermal wait that ran out and a battery health
+# other than good: the phone stays on charge for good, and a degrading
+# battery degrades the measurements next. Like the calm verdict, it informs
+# and nothing else: a reading that fails prints as unknown, and the exit code
+# is the command's own. Then `run` replaces itself with the command (`exec`),
+# which sees BENCH_DEVICE_SERIAL and BENCH_DEVICE_CDP, the
+# local HTTP endpoint of the phone Chrome's DevTools. BENCH_DEVICE_CDP is set
+# only once the device is ready and wired: its presence tells a bench entry
+# point it is already running on a device.
+#
+# BENCH_DEVICE_CHROME_SECONDS bounds each wait for Chrome (its socket, then its
+# endpoint answering), 10 seconds by default, up to a second more; this tool's
+# own tests shorten it.
+#
+# Whatever can be refused without the device is refused before queueing: a
+# usage error, a command that cannot run, adb, curl or bench-lock missing. A typo never
+# waits for its turn.
+#
+# A device asked for and not usable is refused: there is never a fallback to
+# anything else, so a device result is always a device result.
+#
+# Bash and standard POSIX utilities plus `adb` and `curl` (for the DevTools
+# HTTP endpoint), and nothing here knows where this file lives: `bench-lock`
+# is found on PATH, and this file re-launches itself by the path it was
+# started by. It must run on a machine that has
+# neither Node nor the harness. Bash 3.2 included, which is what macOS ships as /bin/bash.
+set -u
+
+# Any failure of the tool itself exits 125, as `bench-lock` does, a refused
+# device included: 1 and 2 belong to the wrapped command, and a refusal must
+# never be mistaken for a bench verdict.
+die() {
+  echo "bench-device: $1" >&2
+  exit 125
+}
+
+usage() { # $1 = what is wrong, when there is something to say
+  {
+    [ -z "${1:-}" ] || echo "bench-device: $1"
+    echo "Usage: bench-device run [--serial <serial>] [--reverse <port>]... -- <command...>"
+  } >&2
+  exit 125
+}
+
+is_number() {
+  case "$1" in "" | *[!0-9]*) return 1 ;; esac
+}
+
+# A TCP port: 1 to 65535, written plainly. No leading zero, which bash
+# arithmetic would read as octal, and at most five digits, which it can compare.
+is_port() {
+  is_number "$1" || return 1
+  case "$1" in 0*) return 1 ;; esac
+  [ "${#1}" -le 5 ] && [ "$1" -le 65535 ]
+}
+
+# ── The command line ─────────────────────────────────────────────────────────
+# Sets serial, ports, and the number of arguments before the command.
+serial="" ports="" before_command=0
+parse_arguments() {
+  [ "${1:-}" = run ] || usage
+  shift
+  before_command=1
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --)
+        before_command=$((before_command + 1))
+        [ "$#" -ge 2 ] || usage "no command after --"
+        return
+        ;;
+      --serial)
+        [ "$#" -ge 2 ] && [ -n "$2" ] && [ "$2" != -- ] || usage "--serial needs a serial"
+        [ -z "$serial" ] || usage "--serial is given twice"
+        serial="$2"
+        ;;
+      --reverse)
+        [ "$#" -ge 2 ] && [ "$2" != -- ] || usage "--reverse needs a port"
+        is_port "$2" || usage "--reverse: $2 is not a port (1 to 65535)"
+        ports="$ports $2"
+        ;;
+      *) usage "unexpected argument: $1" ;;
+    esac
+    before_command=$((before_command + 2))
+    shift 2
+  done
+  usage "no -- before the command"
+}
+
+# What `exec` would refuse, refused before queueing, with the conventional
+# code and one clear line, as `bench-lock` does: a typo must not wait for its
+# turn.
+check_runnable() { # $1 = the command
+  case "$1" in
+    */*)
+      if [ ! -e "$1" ]; then
+        echo "bench-device: $1: No such file or directory" >&2
+        exit 127
+      elif [ -d "$1" ]; then
+        echo "bench-device: $1: Is a directory" >&2
+        exit 126
+      elif [ ! -x "$1" ]; then
+        echo "bench-device: $1: Permission denied" >&2
+        exit 126
+      fi
+      ;;
+    *)
+      if ! type -P "$1" >/dev/null; then
+        echo "bench-device: $1: command not found" >&2
+        exit 127
+      fi
+      ;;
+  esac
+}
+
+# ── adb ──────────────────────────────────────────────────────────────────────
+# From PATH. BENCH_DEVICE_ADB replaces it; the tests point it at a fake.
+adb=""
+find_adb() {
+  if [ -n "${BENCH_DEVICE_ADB:-}" ]; then
+    adb="$(type -P "$BENCH_DEVICE_ADB")" ||
+      die "BENCH_DEVICE_ADB ($BENCH_DEVICE_ADB) is not an executable"
+  else
+    adb="$(type -P adb)" || die "adb not found on PATH ($PATH)"
+  fi
+}
+
+# ── curl ─────────────────────────────────────────────────────────────────────
+find_curl() {
+  type -P curl >/dev/null || die "curl not found on PATH ($PATH)"
+}
+
+# ── Which device ─────────────────────────────────────────────────────────────
+# `adb devices` lists one "<serial>\t<state>" line per device, under a header.
+# Sets device and device_state, or refuses. Without --serial every line
+# overwrites them, and they mean something once exactly one line was counted.
+device="" device_state=""
+pick_device() {
+  local listing line one one_state attached="" count=0
+  listing="$("$adb" devices)" || die "cannot list the attached devices: adb devices failed"
+  while IFS= read -r line; do
+    line="${line%$'\r'}"
+    case "$line" in *$'\t'*) ;; *) continue ;; esac
+    one="${line%%$'\t'*}"
+    one_state="${line#*$'\t'}"
+    count=$((count + 1))
+    attached="$attached${attached:+, }$one ($one_state)"
+    if [ -z "$serial" ] || [ "$one" = "$serial" ]; then
+      device="$one"
+      device_state="$one_state"
+    fi
+  done <<EOF
+$listing
+EOF
+  if [ -n "$serial" ]; then
+    [ "$device" = "$serial" ] ||
+      die "device $serial is not attached; attached: ${attached:-none}"
+  elif [ "$count" -eq 0 ]; then
+    die "no device attached (adb devices lists none)"
+  elif [ "$count" -gt 1 ]; then
+    die "several devices attached: $attached; name one with --serial"
+  fi
+}
+
+# ── Can it be measured on? ───────────────────────────────────────────────────
+# The value of the first "<name>=<value>" line of a dumpsys report.
+dumpsys_value() { # $1 = the report, $2 = the name
+  printf '%s\n' "$1" | sed -n "s/^[[:space:]]*$2=\([A-Za-z]*\).*/\1/p" | head -n 1
+}
+
+check_ready() {
+  local report wakefulness keyguard
+  case "$device_state" in
+    device) ;;
+    unauthorized)
+      die "USB debugging on $device is not authorized for this host: unlock the phone and accept the prompt, with \"Always allow\" ticked"
+      ;;
+    offline) die "$device is offline: unplug it and plug it back, or restart adb (adb kill-server)" ;;
+    *) die "$device is in state '$device_state', not 'device'" ;;
+  esac
+
+  report="$("$adb" -s "$device" shell dumpsys power)" ||
+    die "cannot read the power state of $device: adb shell dumpsys power failed"
+  wakefulness="$(dumpsys_value "$report" mWakefulness)"
+  [ -n "$wakefulness" ] ||
+    die "cannot tell whether the screen of $device is awake: dumpsys power says no mWakefulness"
+  [ "$wakefulness" = Awake ] ||
+    die "the screen of $device is off ($wakefulness): wake it, and keep \"Stay awake\" on in the developer options"
+
+  report="$("$adb" -s "$device" shell dumpsys window)" ||
+    die "cannot read the window state of $device: adb shell dumpsys window failed"
+  keyguard="$(dumpsys_value "$report" isKeyguardShowing)"
+  case "$keyguard" in
+    false) ;;
+    true) die "the keyguard is showing on $device: unlock it, and set its screen lock to None" ;;
+    *) die "cannot tell whether the keyguard is showing on $device: dumpsys window says no isKeyguardShowing" ;;
+  esac
+}
+
+# ── A cool phone ─────────────────────────────────────────────────────────────
+thermal_seconds=300
+thermal_poll_seconds=15
+read_thermal_tunables() {
+  if [ -n "${BENCH_DEVICE_THERMAL_SECONDS:-}" ]; then
+    # No leading zero: bash arithmetic would read it as octal.
+    is_number "$BENCH_DEVICE_THERMAL_SECONDS" && case "$BENCH_DEVICE_THERMAL_SECONDS" in 0?*) false ;; esac ||
+      die "BENCH_DEVICE_THERMAL_SECONDS must be a whole number of seconds, not '$BENCH_DEVICE_THERMAL_SECONDS'"
+    thermal_seconds="$BENCH_DEVICE_THERMAL_SECONDS"
+  fi
+  if [ -n "${BENCH_DEVICE_THERMAL_POLL_SECONDS:-}" ]; then
+    # A number, decimals allowed, and not zero: a poll that never sleeps would
+    # keep the phone busy answering it.
+    case "$BENCH_DEVICE_THERMAL_POLL_SECONDS" in
+      *[!0-9.]* | *.*.*) false ;;
+      *[1-9]*) true ;;
+      *) false ;;
+    esac ||
+      die "BENCH_DEVICE_THERMAL_POLL_SECONDS must be a number of seconds above zero, not '$BENCH_DEVICE_THERMAL_POLL_SECONDS'"
+    thermal_poll_seconds="$BENCH_DEVICE_THERMAL_POLL_SECONDS"
+  fi
+}
+
+# The device's thermal status, by its name in Android's PowerManager, or its
+# number when it has no name there, or nothing when it cannot be read.
+# `dumpsys thermalservice` says it as "Thermal Status: <number>".
+thermal_status() {
+  local report number
+  report="$("$adb" -s "$device" shell dumpsys thermalservice 2>/dev/null)" || return 0
+  number="$(printf '%s\n' "$report" | tr -d '\r' |
+    sed -n 's/^[[:space:]]*Thermal Status:[[:space:]]*\([0-9][0-9]*\)[[:space:]]*$/\1/p' | head -n 1)"
+  case "$number" in
+    "") ;;
+    0) echo none ;;
+    1) echo light ;;
+    2) echo moderate ;;
+    3) echo severe ;;
+    4) echo critical ;;
+    5) echo emergency ;;
+    6) echo shutdown ;;
+    *) echo "$number" ;;
+  esac
+}
+
+# Sets thermal_wait_ran_out to the status the phone still had when the bound
+# expired.
+thermal_wait_ran_out=""
+wait_until_cool() {
+  local status started="$SECONDS" deadline=$((SECONDS + thermal_seconds))
+  # A signal ends the wait at once: bash runs a trap as soon as `wait`
+  # returns, where a foreground `sleep` would hold it back until the sleep
+  # ends, and a SIGINT sent to this process alone would then be dropped.
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 131' QUIT
+  trap 'exit 143' TERM
+  while :; do
+    status="$(thermal_status)"
+    case "$status" in none | "") break ;; esac
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      thermal_wait_ran_out="$status"
+      break
+    fi
+    echo "bench-device: waiting for $device to cool: thermal status $status," \
+      "$((SECONDS - started))s waited of at most ${thermal_seconds}s" >&2
+    sleep "$thermal_poll_seconds" &
+    wait "$!"
+  done
+  trap - HUP INT QUIT TERM
+}
+
+# ── The phone's Chrome ───────────────────────────────────────────────────────
+chrome=com.android.chrome
+chrome_seconds=10
+read_chrome_seconds() {
+  if [ -n "${BENCH_DEVICE_CHROME_SECONDS:-}" ]; then
+    # No leading zero: bash arithmetic would read it as octal.
+    is_number "$BENCH_DEVICE_CHROME_SECONDS" && case "$BENCH_DEVICE_CHROME_SECONDS" in 0?*) false ;; esac ||
+      die "BENCH_DEVICE_CHROME_SECONDS must be a whole number of seconds, not '$BENCH_DEVICE_CHROME_SECONDS'"
+    chrome_seconds="$BENCH_DEVICE_CHROME_SECONDS"
+  fi
+}
+
+# wait_for_chrome <check...>: runs the check twice a second until it passes,
+# for at least chrome_seconds and less than one more. Bash's SECONDS counts
+# whole seconds, and the one it is in has partly gone by. Fails when the check
+# never passed.
+wait_for_chrome() {
+  local deadline=$((SECONDS + chrome_seconds))
+  while :; do
+    "$@" && return 0
+    [ "$SECONDS" -le "$deadline" ] || return 1
+    sleep 0.5
+  done
+}
+
+# Chrome's DevTools socket is an abstract unix socket, listed in
+# /proc/net/unix as "@chrome_devtools_remote", beside other apps' own.
+chrome_socket_listed() {
+  "$adb" -s "$device" shell cat /proc/net/unix | tr -d '\r' | grep -q '@chrome_devtools_remote$'
+}
+
+restart_chrome() {
+  "$adb" -s "$device" shell am force-stop "$chrome" >/dev/null ||
+    die "cannot stop Chrome on $device: adb shell am force-stop failed"
+  "$adb" -s "$device" shell am start -a android.intent.action.VIEW -d about:blank "$chrome" >/dev/null ||
+    die "cannot start Chrome on $device: adb shell am start failed"
+  wait_for_chrome chrome_socket_listed ||
+    die "Chrome's DevTools socket did not show up on $device within ${chrome_seconds}s of its start; is USB debugging still on?"
+}
+
+# The previous forwards of this device only. `adb forward --remove-all` would
+# drop every device's, the host being where forwards live. `adb forward
+# --list` says one "<serial> <local> <remote>" per forward, every device's.
+clear_forwards() {
+  local listing one_serial local_end remote_end
+  listing="$("$adb" forward --list)" ||
+    die "cannot list the previous forwards: adb forward --list failed"
+  while read -r one_serial local_end remote_end; do
+    [ "$one_serial" = "$device" ] || continue
+    "$adb" -s "$device" forward --remove "$local_end" ||
+      die "cannot clear the previous forward $local_end of $device: adb forward --remove failed"
+  done <<EOF
+$(printf '%s\n' "$listing" | tr -d '\r')
+EOF
+}
+
+# Sets cdp, the local HTTP endpoint of the phone Chrome's DevTools.
+cdp=""
+wire_ports() {
+  local port local_port
+  "$adb" -s "$device" reverse --remove-all ||
+    die "cannot clear the previous reversals of $device: adb reverse --remove-all failed"
+  clear_forwards
+  for port in $ports; do
+    "$adb" -s "$device" reverse "tcp:$port" "tcp:$port" >/dev/null ||
+      die "cannot reverse port $port to $device: adb reverse failed"
+  done
+  local_port="$("$adb" -s "$device" forward tcp:0 localabstract:chrome_devtools_remote)" ||
+    die "cannot forward a local port to Chrome's DevTools on $device: adb forward failed"
+  local_port="${local_port%$'\r'}"
+  is_port "$local_port" ||
+    die "cannot forward a local port to Chrome's DevTools on $device: adb forward answered '$local_port', not a port"
+  cdp="http://127.0.0.1:$local_port"
+}
+
+# devtools <path>: a GET on Chrome's DevTools HTTP endpoint. Never through a
+# proxy: the endpoint is on this host's loopback.
+devtools() {
+  curl --silent --fail --max-time 5 --noproxy '*' "$cdp$1"
+}
+
+# One short try, so that the wait stays close to its bound.
+devtools_answers() {
+  curl --silent --fail --max-time 1 --noproxy '*' "$cdp/json/version" >/dev/null
+}
+
+# The tabs /json/list lists, one "<id> <url>" line each, in the order listed:
+# the pages with a numeric id. Chrome lays the list out one key per line, and
+# an object ends on a line that starts with "}".
+list_tabs() { # $1 = the list
+  printf '%s\n' "$1" | awk '
+    function value(line) {
+      sub(/^[^:]*: *"/, "", line)
+      sub(/",?[[:space:]]*$/, "", line)
+      return line
+    }
+    /^[[:space:]]*"id":/ { id = value($0) }
+    /^[[:space:]]*"type":/ { type = value($0) }
+    /^[[:space:]]*"url":/ { url = value($0) }
+    /^[[:space:]]*}/ {
+      if (type == "page" && id ~ /^[0-9]+$/) print id, url
+      id = ""; type = ""; url = ""
+    }
+  '
+}
+
+close_leftover_tabs() {
+  local listing tabs id url kept=""
+  wait_for_chrome devtools_answers ||
+    die "Chrome's DevTools on $device does not answer at $cdp within ${chrome_seconds}s"
+  listing="$(devtools /json/list)" ||
+    die "cannot list Chrome's tabs on $device: $cdp/json/list failed"
+  tabs="$(list_tabs "$listing")"
+  while read -r id url; do
+    if [ -z "$kept" ] && [ "$url" = about:blank ]; then
+      kept="$id"
+    fi
+  done <<EOF
+$tabs
+EOF
+  [ -n "$kept" ] || die "Chrome on $device shows no blank tab, though it was just started on one"
+  while read -r id url; do
+    [ -n "$id" ] && [ "$id" != "$kept" ] || continue
+    devtools "/json/close/$id" >/dev/null ||
+      die "cannot close Chrome's leftover tab $id ($url) on $device"
+  done <<EOF
+$tabs
+EOF
+}
+
+# A launcher intent, as a tap on Chrome's icon: it brings the running Chrome
+# to the front, on the tab it shows, without opening a new one. When Chrome is
+# already in front, `am start` warns that the intent went to the running
+# instance: that is the expected case, so its output is not shown.
+bring_chrome_to_front() {
+  "$adb" -s "$device" shell am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER \
+    -n "$chrome/com.google.android.apps.chrome.Main" >/dev/null 2>&1 ||
+    die "cannot bring Chrome to the front on $device: adb shell am start failed"
+  "$adb" -s "$device" shell input keyevent KEYCODE_WAKEUP ||
+    die "cannot wake the screen of $device: adb shell input keyevent failed"
+}
+
+# ── The device verdict ───────────────────────────────────────────────────────
+# The value of the first "<name>: <value>" line of `dumpsys battery`.
+battery_value() { # $1 = the report, $2 = the name
+  printf '%s\n' "$1" | sed -n "s/^[[:space:]]*$2:[[:space:]]*\(-\{0,1\}[0-9][0-9]*\)[[:space:]]*\$/\1/p" | head -n 1
+}
+
+# The battery's health, by its name in Android's BatteryManager; anything but
+# good is flagged. 1 is Android's own "unknown".
+battery_health_text() { # $1 = the health number, or nothing
+  case "$1" in
+    "" | 1) echo unknown ;;
+    2) echo good ;;
+    3) echo "overheat (not good)" ;;
+    4) echo "dead (not good)" ;;
+    5) echo "over voltage (not good)" ;;
+    6) echo "unspecified failure (not good)" ;;
+    7) echo "cold (not good)" ;;
+    *) echo "$1 (not good)" ;;
+  esac
+}
+
+# The version of the Chrome that answers on the DevTools endpoint: its
+# /json/version says "Browser": "Chrome/<version>".
+chrome_version() {
+  devtools /json/version 2>/dev/null | tr -d '\r' |
+    sed -n 's/^.*"Browser":[[:space:]]*"[^"/]*\/\([^"]*\)".*$/\1/p' | head -n 1
+}
+
+say_device_verdict() {
+  local model status battery tenths temperature="unknown" health version
+  model="$("$adb" -s "$device" shell getprop ro.product.model 2>/dev/null | tr -d '\r' | head -n 1)"
+  status="$(thermal_status)"
+  status="${status:-unknown}"
+  # Read again here, the phone may have cooled since the wait gave up on it.
+  if [ "$thermal_wait_ran_out" = "$status" ]; then
+    status="$status (still not none when the ${thermal_seconds}s wait ran out)"
+  elif [ -n "$thermal_wait_ran_out" ]; then
+    status="$status (was $thermal_wait_ran_out when the ${thermal_seconds}s wait ran out)"
+  fi
+  battery="$("$adb" -s "$device" shell dumpsys battery 2>/dev/null | tr -d '\r')"
+  # Android says the temperature in tenths of a degree Celsius.
+  tenths="$(battery_value "$battery" temperature)"
+  [ -z "$tenths" ] || temperature="$(awk -v tenths="$tenths" 'BEGIN { printf "%.1f C", tenths / 10 }')"
+  health="$(battery_health_text "$(battery_value "$battery" health)")"
+  version="$(chrome_version)"
+  echo "bench-device: on ${model:-an unknown model} ($device): thermal status $status," \
+    "battery temperature $temperature, battery health $health, Chrome ${version:-unknown}" >&2
+}
+
+# ── run ──────────────────────────────────────────────────────────────────────
+# Kept for the re-launch. parse_arguments exits on an empty command line, so
+# this array is never empty where it is expanded: bash 3.2 fails on an empty
+# one under `set -u`.
+original_arguments=("$@")
+parse_arguments "$@"
+shift "$before_command"
+check_runnable "$1"
+find_adb
+find_curl
+read_chrome_seconds
+read_thermal_tunables
+
+# The same `bench-lock` queues this run and settles it: found on PATH here,
+# and found the same way again by the run re-launched under the lock, which
+# inherits this PATH unchanged.
+bench_lock="$(type -P bench-lock)" ||
+  die "bench-lock not found on PATH ($PATH): install the bench skill's executables"
+
+if [ -z "${BENCH_LOCK_HELD:-}" ]; then
+  # Queue as one more bench: `bench-lock` takes the lock, then runs this file
+  # again, with the same arguments, under it.
+  # A path without a slash (`bash bench-device` from its own directory) would
+  # be looked up on PATH, and could find another copy.
+  self="$0"
+  case "$self" in */*) ;; *) self="./$self" ;; esac
+  exec "$bench_lock" run -- "$self" "${original_arguments[@]}"
+fi
+
+pick_device
+check_ready
+wait_until_cool
+restart_chrome
+wire_ports
+close_leftover_tabs
+bring_chrome_to_front
+# From this process, never a subshell: only the lock's holder restarts the
+# end-of-run window. Its exit code is no verdict on the bench.
+"$bench_lock" settle
+say_device_verdict
+export BENCH_DEVICE_SERIAL="$device"
+export BENCH_DEVICE_CDP="$cdp"
+exec "$@"

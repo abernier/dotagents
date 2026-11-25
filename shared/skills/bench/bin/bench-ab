@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# bench-ab: run a control and an experiment command interleaved, under one
+# bench lock, then hand their samples to bench-compare.
+#
+# Interleaved in a counterbalanced order: the first iteration runs control
+# then experiment, the second experiment then control, and so on (AB BA AB
+# ...), warmup and measured iterations alike, so that a position effect (the
+# second run of a pair always warmer, say) falls on both sides.
+#
+# Whatever is compared goes out on stdout too, bench-compare or not: one
+# `bench: compare option <arg>` line per bench-compare option given after
+# `--`, then one `bench: sample <side> <sample>` line per compared sample.
+# A remote run's caller, which cannot reach the samples directory, compares
+# from those lines: bench-remote does, and its job sets BENCH_REMOTE_RUN_ID,
+# so that bench-ab, without bench-compare, names no worker-only path.
+#
+# Usage, the contract with the commands, the samples files and the exit codes:
+# "Run an A/B session" in the bench skill's SKILL.md, one directory up from
+# this file.
+#
+# Bash and standard POSIX utilities only: it runs wherever the bench runs, a
+# worker without Node included. Bash 3.2 included.
+set -u
+
+# Any failure of the tool itself exits 125, as `bench-lock` does: 0 and 1
+# belong to bench-compare's verdict.
+die() {
+  echo "bench-ab: $1" >&2
+  exit 125
+}
+
+usage() {
+  {
+    echo "Usage: bench-ab [-n <runs>] [--warmup <runs>] [--out <dir>] [--drop-noisy]"
+    echo "                --control <command> --experiment <command> [-- <bench-compare option>...]"
+  } >&2
+  exit 125
+}
+
+is_count() {
+  case "$1" in "" | *[!0-9]*) return 1 ;; esac
+}
+
+# ── Arguments ────────────────────────────────────────────────────────────────
+# Checked before the lock, so that a typo never queues.
+runs=10
+warmup=1
+out=""
+control=""
+experiment=""
+drop_noisy=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -n | --warmup | --out | --control | --experiment)
+      [ "$#" -ge 2 ] || usage
+      case "$1" in
+        -n) runs="$2" ;;
+        --warmup) warmup="$2" ;;
+        --out) out="$2" ;;
+        --control) control="$2" ;;
+        --experiment) experiment="$2" ;;
+      esac
+      shift 2
+      ;;
+    --drop-noisy)
+      drop_noisy="--drop-noisy"
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *) usage ;;
+  esac
+done
+# What is left is for bench-compare.
+[ -n "$control" ] && [ -n "$experiment" ] || usage
+is_count "$runs" && [ "$runs" -ge 1 ] || die "-n takes a run count of at least 1, not [$runs]"
+is_count "$warmup" || die "--warmup takes a run count, not [$warmup]"
+
+# ── The lock ─────────────────────────────────────────────────────────────────
+# The skill's shim, its steps 2 to 4. The samples directory is resolved first,
+# so that the re-launched session writes where this one said it would.
+if [ -z "$out" ]; then
+  out="$(mktemp -d "${TMPDIR:-/tmp}/bench-ab.XXXXXX")" || die "cannot create a samples directory"
+fi
+case "$out" in /*) ;; *) out="$PWD/$out" ;; esac
+if [ -z "${BENCH_LOCK_HELD:-}" ]; then
+  if command -v bench-lock >/dev/null 2>&1; then
+    exec bench-lock run -- bash "$0" -n "$runs" --warmup "$warmup" --out "$out" \
+      --control "$control" --experiment "$experiment" ${drop_noisy:+"$drop_noisy"} -- "$@"
+  fi
+  echo "bench-ab: bench-lock is not on PATH; this run is NOT isolated, another bench may share the machine" >&2
+fi
+
+# ── The session ──────────────────────────────────────────────────────────────
+mkdir -p "$out" || die "cannot create the samples directory $out"
+: >"$out/control" && : >"$out/experiment" || die "cannot write the samples files in $out"
+: >"$out/control.reading" && : >"$out/experiment.reading" || die "cannot write the readings files in $out"
+
+# reading: the calm verdict of this instant, from `bench-lock` itself:
+# "cpu 0.42 per core: calm (noisy above 0.50)". The CPU is sampled over about a
+# second (iostat's shortest interval, on macOS), and never while a run goes:
+# it would read the bench itself. So the session reads the machine between
+# runs, once before the first measured run and once after each, and a run's tag
+# is the worse of the readings on either side of it: about a second per
+# measured run, the price of a tag that covers the run.
+reading() {
+  local verdict=""
+  if command -v bench-lock >/dev/null 2>&1; then
+    verdict="$(bench-lock reading 2>/dev/null)"
+    printf '%s\n' "${verdict:-no reading: no verdict}"
+  else
+    echo "no reading (bench-lock is not on PATH): no verdict"
+  fi
+}
+
+# worse_reading <reading> <reading>: noisy over no verdict over calm, then the
+# busier.
+worse_reading() {
+  printf '%s\n%s\n' "$1" "$2" | awk '
+    {
+      rank = index($0, ": noisy (") ? 2 : (index($0, ": calm (") ? 0 : 1)
+      value = $2 + 0
+      if (NR == 1 || rank > best_rank || (rank == best_rank && value > best_value)) {
+        best = $0; best_rank = rank; best_value = value
+      }
+    }
+    END { print best }'
+}
+
+# run <side> <command> <label>: one run; its sample on stdout.
+run() {
+  local output status sample
+  echo "bench-ab: $3 $1" >&2
+  output="$(sh -c "$2" </dev/null)"
+  status=$?
+  [ "$status" -eq 0 ] || die "$3 $1 failed with exit code $status: $2"
+  sample="$(printf '%s\n' "$output" | tr '\n' ' ' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+  if ! printf '%s\n' "$sample" | grep -Eq '^-?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][-+]?[0-9]+)?$|^\{.*\}$'; then
+    die "$3 $1 printed [$sample], not a number or a JSON object: $2"
+  fi
+  printf '%s\n' "$sample"
+}
+
+total=$((warmup + runs))
+i=1
+before=""
+while [ "$i" -le "$total" ]; do
+  # The iteration's rank among its kind, warmup or measured: odd runs control
+  # first, even experiment first.
+  if [ "$i" -le "$warmup" ]; then
+    rank=$i
+    label="warmup $i/$warmup"
+  else
+    rank=$((i - warmup))
+    label="run $rank/$runs"
+    [ -n "$before" ] || before="$(reading)"
+  fi
+  if [ $((rank % 2)) -eq 1 ]; then order="control experiment"; else order="experiment control"; fi
+  for side in $order; do
+    if [ "$side" = control ]; then command="$control"; else command="$experiment"; fi
+    sample="$(run "$side" "$command" "$label")" || exit 125
+    [ "$i" -gt "$warmup" ] || continue
+    after="$(reading)"
+    echo "$sample" >>"$out/$side"
+    worse_reading "$before" "$after" >>"$out/$side.reading"
+    before="$after"
+  done
+  i=$((i + 1))
+done
+
+echo "bench-ab: samples in $out/control and $out/experiment, their readings in $out/control.reading and $out/experiment.reading" >&2
+
+# --drop-noisy: only the samples whose reading says calm go to the comparison,
+# through <side>.calm files; the samples files stay whole.
+#
+# What is left must still be enough for bench-compare, with it or without it
+# (a worker has none): its own rule, from bench-compare.stats.mts. The Moses
+# 95% interval runs from the k-th smallest pairwise difference, k =
+# floor(nm/2 - 1.96 sqrt(nm(n+m+1)/12)) for n control and m experiment
+# samples, and needs k >= 1: with equal sides, 4 each.
+enough_to_compare() { # $1 = control samples, $2 = experiment samples
+  awk -v n="$1" -v m="$2" 'BEGIN {
+    k = int(n * m / 2 - 1.959963984540054 * sqrt(n * m * (n + m + 1) / 12))
+    exit !(k >= 1)
+  }'
+}
+compared=""
+if [ -n "$drop_noisy" ]; then
+  dropped=""
+  for side in control experiment; do
+    awk 'NR == FNR { calm[FNR] = index($0, ": calm (") > 0; next } calm[FNR]' \
+      "$out/$side.reading" "$out/$side" >"$out/$side.calm" || die "cannot write $out/$side.calm"
+    kept="$(wc -l <"$out/$side.calm" | tr -d ' ')"
+    dropped="$dropped${dropped:+ and }$((runs - kept)) of $runs $side"
+    if [ "$side" = control ]; then kept_control="$kept"; else kept_experiment="$kept"; fi
+  done
+  echo "bench-ab: dropped $dropped samples as noisy or unread" >&2
+  enough_to_compare "$kept_control" "$kept_experiment" ||
+    die "after dropping the noisy or unread samples, $kept_control control and $kept_experiment experiment samples are too few for bench-compare's 95% interval; rerun with a larger -n, or on a calmer machine"
+  compared=".calm"
+fi
+# What is compared goes out on stdout (see the header).
+for option in "$@"; do
+  printf 'bench: compare option %s\n' "$option"
+done
+sed 's/^/bench: sample control /' "$out/control$compared"
+sed 's/^/bench: sample experiment /' "$out/experiment$compared"
+if command -v bench-compare >/dev/null 2>&1; then
+  exec bench-compare "$@" "$out/control$compared" "$out/experiment$compared"
+fi
+if [ -n "${BENCH_REMOTE_RUN_ID:-}" ]; then
+  echo "bench-ab: bench-compare is not on PATH; bench-remote compares these samples on the caller" >&2
+  exit 0
+fi
+options=""
+[ "$#" -eq 0 ] || options="$(printf '%q ' "$@")"
+echo "bench-ab: bench-compare is not on PATH; compare on the caller: bench-compare $options$out/control$compared $out/experiment$compared" >&2
